@@ -3,3 +3,11 @@ __pycache__/
 .pytest_cache/
 *.db
 .env
+.env.*
+!.env.example
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log

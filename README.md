@@ -1,8 +1,10 @@
-# LearnerTwin — AI/ML FastAPI Starter
+# LearnerTwin
 
-A first working backend for the three-concept Python fundamentals prototype. No external AI model or API key required.
+LearnerTwin is an adaptive learning prototype with a React frontend and a FastAPI backend. The backend uses a fixed-parameter Bayesian Knowledge Tracing model and SQLite; no external AI model or API key is required for the learning flow.
 
-## Run on Windows (PowerShell)
+## Run locally on Windows
+
+Start the backend in one PowerShell terminal:
 
 ```powershell
 py -m venv .venv
@@ -11,46 +13,38 @@ pip install -r requirements.txt
 python -m uvicorn app.main:app --reload
 ```
 
-Open http://127.0.0.1:8000/docs to try the API interactively.
+In another terminal, install the frontend dependencies and start Vite:
 
-## Core endpoints
+```powershell
+npm install
+npm run dev
+```
+
+The frontend runs at http://127.0.0.1:3000 and the interactive API documentation is at http://127.0.0.1:8000/docs. Set `VITE_API_BASE_URL` in `.env.local` to override the backend URL; it defaults to `http://127.0.0.1:8000`.
+
+## Tests and checks
+
+```powershell
+py -m pytest -q
+npm run lint
+npm run build
+```
+
+## Backend API
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Service health |
-| GET | `/concepts` | Three concept IDs |
-| GET | `/questions` | Safe question list without answer keys |
-| POST | `/learners` | Create fictional learner `{"nickname":"Demo"}` |
-| GET | `/learners/{learner_id}/profile` | Concept knowledge estimates |
-| POST | `/learners/{learner_id}/assessments` | Submit question IDs and option answers |
-| GET | `/learners/{learner_id}/recommendation` | Next practice concept with reason |
-| GET | `/learners/{learner_id}/history` | Full evidence history |
-| GET | `/learners/{learner_id}/misconceptions` | Error tags, not definitive diagnoses |
+| GET | `/concepts` | Available concept IDs |
+| GET | `/questions` | Questions without answer keys; accepts `concept_id` filter |
+| GET | `/learners` | List learner profiles |
+| POST | `/learners` | Create a learner |
+| GET | `/learners/{learner_id}/profile` | Concept mastery estimates |
+| POST | `/learners/{learner_id}/assessments` | Submit answers |
+| GET | `/learners/{learner_id}/recommendation` | Next-practice recommendation |
+| GET | `/learners/{learner_id}/history` | Assessment evidence history |
+| GET | `/learners/{learner_id}/misconceptions` | Incorrect-response tags |
 
-Example assessment request:
+## Model limitations
 
-```json
-{"answers":[{"question_id":"v1","selected_answer":"int"},{"question_id":"l1","selected_answer":"2"}]}
-```
-
-## ML behavior and limitations
-
-`app/engine.py` implements a fixed-parameter Bayesian Knowledge Tracing rule:
-- Prior mastery: 0.25
-- Learning probability per attempt: 0.12
-- Guess probability: 0.20
-- Slip probability: 0.10
-
-These parameters are **illustrative assumptions**, not trained or calibrated. A correct answer updates the estimate upward; an incorrect answer generally updates it downward. The recommendation targets the lowest estimated mastery and explains why. The misconception endpoint shows tags tied to incorrectly answered questions, not a psychological diagnosis. Learning curves and retention predictions require repeated real observations and held-out evaluation. Quizzes and answer keys are coded server-side for the prototype.
-
-## Tests
-
-```powershell
-python -m pytest -q
-```
-
-## Integration notes
-
-- Another teammate can replace the SQLite access layer with their database implementation while maintaining these contracts.
-- This MVP does not include authentication, rate limiting, or production access control. **Do not deploy with real student data.**
-- Next: calibration dataset, per-question difficulty metadata, time-aware revision scheduling, learner identity/access controls, and benchmarking against static rule baselines.
+`app/engine.py` implements an illustrative, fixed-parameter BKT rule. Its parameters are not trained or calibrated, so mastery estimates are provisional and should not be treated as validated probabilities. Misconception tags describe incorrect answers, not diagnoses. This prototype does not include authentication, rate limiting, or production access controls; do not use it with real student data.

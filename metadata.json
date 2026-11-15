@@ -1,0 +1,6 @@
+{
+  "name": "LearnerTwin",
+  "description": "Adaptive student knowledge modeling platform that builds an evolving knowledge profile from assessment evidence, detects recurring misconceptions, and recommends personalized practice.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

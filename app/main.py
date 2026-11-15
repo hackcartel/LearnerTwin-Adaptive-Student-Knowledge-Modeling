@@ -9,6 +9,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .engine import PRIOR, recommendation, update_mastery
 
@@ -54,7 +55,8 @@ def initialize():
     with db() as conn:
         conn.executescript('''
         CREATE TABLE IF NOT EXISTS learners (
-            id TEXT PRIMARY KEY, nickname TEXT NOT NULL, created_at TEXT NOT NULL
+            id TEXT PRIMARY KEY, nickname TEXT NOT NULL, created_at TEXT NOT NULL,
+            learning_track TEXT NOT NULL DEFAULT 'Python Foundations', goal TEXT
         );
         CREATE TABLE IF NOT EXISTS mastery (
             learner_id TEXT NOT NULL REFERENCES learners(id),
@@ -70,6 +72,15 @@ def initialize():
             mastery_after REAL NOT NULL, created_at TEXT NOT NULL
         );
         ''')
+        learner_columns = {
+            row['name'] for row in conn.execute('PRAGMA table_info(learners)').fetchall()
+        }
+        if 'learning_track' not in learner_columns:
+            conn.execute(
+                "ALTER TABLE learners ADD COLUMN learning_track TEXT NOT NULL DEFAULT 'Python Foundations'"
+            )
+        if 'goal' not in learner_columns:
+            conn.execute('ALTER TABLE learners ADD COLUMN goal TEXT')
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -77,9 +88,17 @@ async def lifespan(_app: FastAPI):
     yield
 
 app = FastAPI(title='LearnerTwin Learning Intelligence API', version='0.1.0', lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'],
+    allow_methods=['GET', 'POST', 'OPTIONS'],
+    allow_headers=['Content-Type', 'Accept'],
+)
 
 class LearnerCreate(BaseModel):
     nickname: str = Field(min_length=1, max_length=80)
+    learning_track: str = Field(default='Python Foundations', min_length=1, max_length=80)
+    goal: str | None = Field(default=None, max_length=160)
 
 class Answer(BaseModel):
     question_id: str
@@ -90,16 +109,25 @@ class AssessmentSubmit(BaseModel):
 
 
 def assert_learner(conn, learner_id: str):
-    record = conn.execute('SELECT id, nickname FROM learners WHERE id=?', (learner_id,)).fetchone()
+    record = conn.execute(
+        'SELECT id, nickname, learning_track, goal, created_at FROM learners WHERE id=?',
+        (learner_id,)
+    ).fetchone()
     if not record:
         raise HTTPException(404, 'Learner not found')
     return dict(record)
 
 
 def concept_profile(conn, learner_id: str):
-    rows = conn.execute('SELECT concept_id, estimate, attempts FROM mastery WHERE learner_id=?', (learner_id,)).fetchall()
+    rows = conn.execute('''SELECT mastery.concept_id, mastery.estimate, mastery.attempts,
+            (SELECT COUNT(*) FROM attempts
+             WHERE attempts.learner_id=mastery.learner_id
+               AND attempts.concept_id=mastery.concept_id
+               AND attempts.correct=1) AS correct_count
+        FROM mastery WHERE mastery.learner_id=?''', (learner_id,)).fetchall()
     return [{'concept_id': row['concept_id'], 'name': CONCEPTS[row['concept_id']],
              'mastery': row['estimate'], 'attempts': row['attempts'],
+             'correct_count': row['correct_count'],
              'evidence_status': 'no_evidence' if not row['attempts'] else 'provisional'} for row in rows]
 
 @app.get('/health')
@@ -118,20 +146,45 @@ def questions(concept_id: str | None = None):
              'options': item['options']} for key, item in QUESTIONS.items()
             if concept_id is None or item['concept_id'] == concept_id]
 
+@app.get('/learners')
+def list_learners():
+    with db() as conn:
+        rows = conn.execute(
+            '''SELECT id, nickname, learning_track, goal, created_at
+               FROM learners ORDER BY created_at, rowid'''
+        ).fetchall()
+        return [dict(row) for row in rows]
+
 @app.post('/learners', status_code=201)
 def create_learner(payload: LearnerCreate):
     learner_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
     with db() as conn:
-        conn.execute('INSERT INTO learners VALUES (?, ?, ?)', (learner_id, payload.nickname, datetime.now(timezone.utc).isoformat()))
+        conn.execute(
+            '''INSERT INTO learners (id, nickname, created_at, learning_track, goal)
+               VALUES (?, ?, ?, ?, ?)''',
+            (learner_id, payload.nickname, created_at, payload.learning_track, payload.goal)
+        )
         conn.executemany('INSERT INTO mastery VALUES (?, ?, ?, ?)',
                          [(learner_id, concept_id, PRIOR, 0) for concept_id in CONCEPTS])
-    return {'learner_id': learner_id, 'nickname': payload.nickname}
+    return {'learner_id': learner_id, 'nickname': payload.nickname,
+            'learning_track': payload.learning_track, 'goal': payload.goal,
+            'created_at': created_at}
 
 @app.get('/learners/{learner_id}/profile')
 def profile(learner_id: str):
     with db() as conn:
         learner = assert_learner(conn, learner_id)
-        return {'learner': learner, 'concepts': concept_profile(conn, learner_id),
+        concepts = concept_profile(conn, learner_id)
+        assessed = [item['mastery'] for item in concepts if item['attempts']]
+        assessments_completed = conn.execute(
+            'SELECT COUNT(DISTINCT created_at) FROM attempts WHERE learner_id=?',
+            (learner_id,)
+        ).fetchone()[0]
+        return {'learner': learner, 'concepts': concepts,
+                'concepts_assessed': len(assessed), 'total_concepts': len(CONCEPTS),
+                'assessments_completed': assessments_completed,
+                'overall_mastery': sum(assessed) / len(assessed) if assessed else None,
                 'model': 'fixed_parameter_bkt_v1',
                 'disclaimer': 'Estimates are provisional, not validated probabilities of student knowledge.'}
 
@@ -145,6 +198,7 @@ def submit_assessment(learner_id: str, payload: AssessmentSubmit):
         if answer.selected_answer not in question['options']:
             raise HTTPException(422, f'Invalid answer option for {answer.question_id}')
     results = []
+    submitted_at = datetime.now(timezone.utc).isoformat()
     with db() as conn:
         assert_learner(conn, learner_id)
         for answer in payload.answers:
@@ -156,17 +210,21 @@ def submit_assessment(learner_id: str, payload: AssessmentSubmit):
             correct = answer.selected_answer == question['answer']
             after = update_mastery(before, correct)
             tag = None if correct else question['misconception']
-            now = datetime.now(timezone.utc).isoformat()
             conn.execute('UPDATE mastery SET estimate=?, attempts=? WHERE learner_id=? AND concept_id=?',
                          (after, row['attempts'] + 1, learner_id, concept_id))
             conn.execute('INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                          (str(uuid4()), learner_id, answer.question_id, concept_id,
-                          answer.selected_answer, int(correct), tag, before, after, now))
+                          answer.selected_answer, int(correct), tag, before, after, submitted_at))
             results.append({'question_id': answer.question_id, 'concept_id': concept_id,
                             'correct': correct, 'misconception_tag': tag,
-                            'mastery_before': before, 'mastery_after': after})
+                            'mastery_before': before, 'mastery_after': after,
+                            'prompt': question['prompt'],
+                            'selected_answer': answer.selected_answer,
+                            'correct_answer': question['answer']})
         snapshot = concept_profile(conn, learner_id)
-    return {'results': results, 'profile': snapshot, 'recommendation': recommendation(snapshot)}
+    return {'assessment_id': str(uuid4()), 'submitted_at': submitted_at,
+            'results': results, 'profile': snapshot,
+            'recommendation': recommendation(snapshot)}
 
 @app.get('/learners/{learner_id}/recommendation')
 def get_recommendation(learner_id: str):
@@ -178,17 +236,24 @@ def get_recommendation(learner_id: str):
 def history(learner_id: str):
     with db() as conn:
         assert_learner(conn, learner_id)
-        rows = conn.execute('''SELECT id, question_id, concept_id, correct,
+        rows = conn.execute('''SELECT id, question_id, concept_id, selected_answer, correct,
             misconception_tag, mastery_before, mastery_after, created_at
             FROM attempts WHERE learner_id=? ORDER BY created_at, rowid''', (learner_id,)).fetchall()
-        return [dict(row) for row in rows]
+        history_items = []
+        for row in rows:
+            item = dict(row)
+            item['prompt'] = QUESTIONS[item['question_id']]['prompt']
+            history_items.append(item)
+        return history_items
 
 @app.get('/learners/{learner_id}/misconceptions')
 def misconceptions(learner_id: str):
     with db() as conn:
         assert_learner(conn, learner_id)
-        rows = conn.execute('''SELECT misconception_tag, COUNT(*) AS occurrences
+        rows = conn.execute('''SELECT misconception_tag, concept_id,
+            MAX(created_at) AS last_observed_at, COUNT(*) AS occurrences
             FROM attempts WHERE learner_id=? AND misconception_tag IS NOT NULL
-            GROUP BY misconception_tag ORDER BY occurrences DESC, misconception_tag''', (learner_id,)).fetchall()
+            GROUP BY misconception_tag, concept_id
+            ORDER BY occurrences DESC, misconception_tag''', (learner_id,)).fetchall()
         return {'signals': [dict(row) for row in rows],
                 'disclaimer': 'Tags describe incorrect responses, not proven misconceptions.'}
