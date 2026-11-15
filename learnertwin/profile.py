@@ -15,6 +15,8 @@ def _parse_timestamp(value: Optional[Timestamp]) -> Optional[datetime]:
         parsed = value
     elif isinstance(value, str):
         try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
             parsed = datetime.fromisoformat(value)
         except ValueError:
             return None
